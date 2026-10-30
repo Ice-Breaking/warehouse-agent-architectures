@@ -13,12 +13,12 @@ import warehouse_deliberative_agent as delib
 import warehouse_hybrid_agent as hybrid
 
 
-def node_names(graph) -> set:
+def node_names(graph) -> set[str]:
     """去掉 langgraph 自带的 __start__ / __end__，只留业务节点"""
     return {name for name in graph.get_graph().nodes if not name.startswith("__")}
 
 
-def edge_pairs(graph) -> set:
+def edge_pairs(graph) -> set[tuple[str, str]]:
     return {(edge.source, edge.target) for edge in graph.get_graph().edges}
 
 

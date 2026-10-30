@@ -15,11 +15,12 @@
 """
 
 import json
+from typing import Any
 
 import warehouse_data as wd
 
 
-def call(tool_name: str, **kwargs) -> dict:
+def call(tool_name: str, **kwargs) -> dict[str, Any]:
     """调用工具并把 JSON 字符串解析成字典"""
     return json.loads(wd.TOOL_MAP[tool_name].invoke(kwargs))
 

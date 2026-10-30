@@ -12,7 +12,7 @@ import pytest
 import warehouse_deliberative_agent as delib
 
 
-def empty_state() -> dict:
+def empty_state() -> delib.DelibState:
     return {
         "question": "生成一份全楼库房的季度巡检报告",
         "perception": "",

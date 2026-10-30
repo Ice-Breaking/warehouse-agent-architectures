@@ -66,12 +66,14 @@ def test_parser_should_strip_code_fence_around_json():
     result = parse(
         'Action: query_energy_stat\nAction Input: ```json\n{"storage_name": "全部"}\n```'
     )
+    assert isinstance(result, AgentAction)
     assert result.tool_input == {"storage_name": "全部"}
 
 
 def test_parser_should_fall_back_to_scalar_for_single_argument():
     """单参数工具允许直接给文本，不必强制 JSON"""
     result = parse("Action: query_environment\nAction Input: 3楼2号库房")
+    assert isinstance(result, AgentAction)
     assert result.tool_input == "3楼2号库房"
 
 

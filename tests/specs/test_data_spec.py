@@ -32,7 +32,7 @@ def all_storages() -> List[Tuple[int, str, Dict[str, Any]]]:
     return result
 
 
-def all_racks() -> set:
+def all_racks() -> set[str]:
     """空间树里的全部密集架编号"""
     return {
         rack

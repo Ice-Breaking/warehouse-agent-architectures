@@ -176,7 +176,7 @@ def _parse_assess(raw: str) -> Tuple[str, str, str]:
     return query_type, mode, priority
 
 
-def assess(state: HybridState) -> dict:
+def assess(state: HybridState) -> dict[str, Any]:
     """协调层：评估查询类型、处理模式与优先级，三项都校验通过才放行"""
     raw = wd.chat_with_system(SYSTEM_PROMPT, ASSESS_PROMPT.format(question=state["question"]))
     query_type, mode, priority = _parse_assess(raw)
@@ -189,7 +189,7 @@ def pick_route(state: HybridState) -> str:
     return state["processing_mode"]
 
 
-def reactive_agent(state: HybridState) -> dict:
+def reactive_agent(state: HybridState) -> dict[str, Any]:
     """反应式分支：模型自主决定下一步，代码只负责解析与回灌"""
     if state["steps"] >= wd.MAX_ROUNDS:
         raise RuntimeError(f"反应式分支已调用 {state['steps']} 轮工具，超过上限 {wd.MAX_ROUNDS}，终止")
@@ -218,7 +218,7 @@ def reactive_agent(state: HybridState) -> dict:
     }
 
 
-def execute_tools(state: HybridState) -> dict:
+def execute_tools(state: HybridState) -> dict[str, Any]:
     """执行上一步解析出的工具调用，把返回值回灌进 scratchpad"""
     tool_item = wd.TOOL_MAP.get(state["pending_tool"])
     if tool_item is None:
@@ -242,7 +242,7 @@ def after_reactive(state: HybridState) -> str:
     return "answer" if state["final_answer"] else "tools"
 
 
-def collect_energy(state: HybridState) -> dict:
+def collect_energy(state: HybridState) -> dict[str, Any]:
     """固定分析分支第一步：真实调用工具采集数据，不让模型生成"""
 
     energy = str(wd.query_energy_stat.invoke({"storage_name": "全部"}))
@@ -257,7 +257,7 @@ def collect_energy(state: HybridState) -> dict:
     return {"energy_data": energy, "env_data": env_data}
 
 
-def analyze_energy(state: HybridState) -> dict:
+def analyze_energy(state: HybridState) -> dict[str, Any]:
     """深思熟虑层第二步：深度分析，只做对比与异常定位，不给建议"""
     user_prompt = ANALYZE_PROMPT.format(
         energy_data=state["energy_data"],
@@ -269,7 +269,7 @@ def analyze_energy(state: HybridState) -> dict:
     return {"analysis": analysis}
 
 
-def recommend(state: HybridState) -> dict:
+def recommend(state: HybridState) -> dict[str, Any]:
     """深思熟虑层第三步：生成建议，只给可执行动作，不重复分析结论"""
     user_prompt = RECOMMEND_PROMPT.format(analysis=state["analysis"], priority=state["priority"])
     recommendation = wd.chat_with_system(SYSTEM_PROMPT, user_prompt).strip()
@@ -277,7 +277,7 @@ def recommend(state: HybridState) -> dict:
     return {"recommendation": recommendation}
 
 
-def make_answer(state: HybridState) -> dict:
+def make_answer(state: HybridState) -> dict[str, Any]:
     """两条分支的统一出口"""
     if state["processing_mode"] == "reactive":
         answer = state["final_answer"]

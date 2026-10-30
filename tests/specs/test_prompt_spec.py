@@ -18,7 +18,7 @@ import warehouse_hybrid_agent as hybrid
 import warehouse_react_agent as react
 
 
-def placeholders(template: str) -> set:
+def placeholders(template: str) -> set[str]:
     """取出模板里的全部变量名，自动跳过 {{ }} 这类转义花括号"""
     return {name for _, name, _, _ in Formatter().parse(template) if name}
 

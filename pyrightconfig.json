@@ -1,0 +1,10 @@
+{
+  "extraPaths": [".", "01-reactive", "02-hybrid", "03-deliberative", "tests"],
+  "executionEnvironments": [
+    { "root": "." },
+    { "root": "01-reactive" },
+    { "root": "02-hybrid" },
+    { "root": "03-deliberative" },
+    { "root": "tests" }
+  ]
+}

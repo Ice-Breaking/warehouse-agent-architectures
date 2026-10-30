@@ -34,7 +34,7 @@
 import sys
 from functools import lru_cache
 from pathlib import Path
-from typing import TypedDict
+from typing import Any, TypedDict
 
 from langgraph.graph import END, StateGraph
 
@@ -115,7 +115,7 @@ class DelibState(TypedDict):
     report: str
 
 
-def perception(state: DelibState) -> dict:
+def perception(state: DelibState) -> dict[str, Any]:
     """第一阶段：代码调用真实工具采集数据，模型不参与
 
     这一步是整条流水线可信度的基础：后续所有阶段只能引用这里采集到的原文。
@@ -135,21 +135,21 @@ def perception(state: DelibState) -> dict:
     return {"perception": perception_text}
 
 
-def modeling(state: DelibState) -> dict:
+def modeling(state: DelibState) -> dict[str, Any]:
     """第二阶段：把原始数据整理成风险矩阵"""
     risk_model = wd.chat_with_system(SYSTEM_PROMPT, MODELING_PROMPT.format(perception=state["perception"])).strip()
     print(f"\n[阶段 2/5 建模]\n{risk_model}")
     return {"risk_model": risk_model}
 
 
-def reasoning(state: DelibState) -> dict:
+def reasoning(state: DelibState) -> dict[str, Any]:
     """第三阶段：提出三套整改方案"""
     plans = wd.chat_with_system(SYSTEM_PROMPT, REASONING_PROMPT.format(risk_model=state["risk_model"])).strip()
     print(f"\n[阶段 3/5 推理]\n{plans}")
     return {"plans": plans}
 
 
-def decide(state: DelibState) -> dict:
+def decide(state: DelibState) -> dict[str, Any]:
     """第四阶段：选定一套方案并说明取舍"""
     decision = wd.chat_with_system(
         SYSTEM_PROMPT,
@@ -159,7 +159,7 @@ def decide(state: DelibState) -> dict:
     return {"decision": decision}
 
 
-def write_report(state: DelibState) -> dict:
+def write_report(state: DelibState) -> dict[str, Any]:
     """第五阶段：成文"""
     report = wd.chat_with_system(
         SYSTEM_PROMPT,

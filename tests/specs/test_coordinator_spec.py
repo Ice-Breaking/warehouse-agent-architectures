@@ -110,7 +110,28 @@ def test_assess_error_should_carry_the_raw_output():
 
 # ——— 分支只认处理模式 ———
 
+def state_with(processing_mode: str, priority: str) -> hybrid.HybridState:
+    """构造一个完整状态，只把处理模式与优先级作为变量"""
+    return {
+        "question": "对比一下各库房的能耗情况",
+        "history": "无",
+        "query_type": "analytical",
+        "processing_mode": processing_mode,
+        "priority": priority,
+        "steps": 0,
+        "scratchpad": "",
+        "pending_tool": "",
+        "pending_input": {},
+        "final_answer": "",
+        "energy_data": "",
+        "env_data": "",
+        "analysis": "",
+        "recommendation": "",
+        "answer": "",
+    }
+
+
 def test_pick_route_should_follow_processing_mode():
     """优先级不参与分支选择，避免与处理模式打架"""
-    assert hybrid.pick_route({"processing_mode": "reactive", "priority": "high"}) == "reactive"
-    assert hybrid.pick_route({"processing_mode": "deliberative", "priority": "high"}) == "deliberative"
+    assert hybrid.pick_route(state_with("reactive", "high")) == "reactive"
+    assert hybrid.pick_route(state_with("deliberative", "high")) == "deliberative"

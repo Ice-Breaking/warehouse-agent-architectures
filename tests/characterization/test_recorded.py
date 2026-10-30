@@ -10,6 +10,7 @@
 """
 
 import pytest
+from typing import Any
 
 import warehouse_deliberative_agent as delib
 import warehouse_hybrid_agent as hybrid
@@ -18,7 +19,7 @@ import warehouse_react_agent as react
 pytestmark = pytest.mark.recorded
 
 
-def require(recording, name: str) -> dict:
+def require(recording, name: str) -> dict[str, Any]:
     """取录制件，缺件时跳过而不是失败——录制需要 API Key，不是所有人都具备"""
     try:
         return recording(name)
