@@ -6,6 +6,14 @@
 控制流完全交给模型：每一轮由模型观察上一步的工具返回，自主决定下一步调用哪个工具，
 直到它自己输出 Final Answer。代码只提供工具集合、输出解析器与终止条件，不预设路径。
 
+四个步骤在本仓库里的落点：
+
+    Step1 数据准备   warehouse_data.py  空间树、设备台账、档案台账、能源环境
+    Step2 工具设计   warehouse_data.py  六个工具，内部完成参数校验与存在性预检
+    Step3 Agent 搭建 本文件            提示词模板 + 输出解析器 + 执行循环
+    Step4 知识边界   三层配合          warehouse_data 的 check_scope 入口预检、
+                                      工具层非 0 响应码硬校验、本文件提示词约束
+
 域数据、工具集合、职责边界与模型入口来自仓库根目录的 warehouse_data，
 本项目只实现反应式的控制流。
 
@@ -33,6 +41,17 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from warehouse_data import TOOL_MAP, _chat, build_tool_descriptions, check_scope, LLM_MODEL
 
+
+# ==========================================================================
+# Step3 Agent 搭建
+#
+# 三件套，落点依次如下：
+#   1. 提示词模板   FORMAT_EXAMPLE（格式示例）+ REACT_TEMPLATE（主模板）+ REACT_PROMPT
+#   2. 输出解析器   ReActOutputParser，把模型文本解析为 AgentAction 或 AgentFinish
+#   3. 执行循环     run_react_agent，调用模型 -> 解析 -> 执行工具 -> 回灌观察
+# ==========================================================================
+
+# 提示词模板之一：给模型看的调用格式样例
 FORMAT_EXAMPLE = """Thought: 需要先确认库区在空间树中的标准名称
 Action: resolve_scene_target
 Action Input: {"target_text": "3楼2号库房低氧区"}
@@ -77,6 +96,7 @@ _ACTION_PATTERN = re.compile(r"Action\s*[:：]\s*([A-Za-z_][A-Za-z0-9_]*)", re.I
 _ACTION_INPUT_PATTERN = re.compile(r"Action\s*Input\s*[:：]\s*(.*)", re.IGNORECASE | re.DOTALL)
 
 
+# 输出解析器：把模型文本解析为 AgentAction 或 AgentFinish
 class ReActOutputParser(BaseOutputParser[Union[AgentAction, AgentFinish]]):
     """解析 ReAct 文本输出，产出 AgentAction 或 AgentFinish。
 
@@ -146,6 +166,7 @@ def _format_history(history: List[Tuple[str, str]]) -> str:
     return "\n".join(f"用户：{asked}\n助手：{answered}" for asked, answered in recent)
 
 
+# 执行循环：调用模型 -> 解析 -> 执行工具 -> 回灌观察，直到 AgentFinish 或超过轮次上限
 def run_react_agent(question: str, history: List[Tuple[str, str]], max_iterations: int = 6) -> str:
     """执行一次反应式推理，返回最终答复"""
     scope_reply = check_scope(question)

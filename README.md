@@ -25,7 +25,7 @@ python 03-deliberative/warehouse_deliberative_agent.py
 | | 01 反应式 | 02 混合式 | 03 深思熟虑 |
 |---|---|---|---|
 | 控制流决策者 | 模型全程决定 | 路由一次，之后分派 | 代码写死 |
-| 模型调用次数 | 不固定，直到自己收尾 | 简单 2-3 次，复杂 2 次 | 固定 5 阶段 |
+| 模型调用次数 | 不固定，直到自己收尾 | 简单 2-4 次，复杂 3 次 | 固定 5 阶段，其中 4 次模型调用 |
 | 能否中途改路径 | 能 | 不能，路由后固定 | 不能 |
 | 谁来调工具 | 模型自己决定 | 简单分支模型决定，复杂分支代码指定 | 代码指定 |
 | 典型任务 | 单目标查询 | 混合负载 | 结构固定的产出物 |
@@ -44,12 +44,35 @@ warehouse-agent-architectures/
 ├── warehouse_data.py         三个项目共用的域数据、工具与模型入口
 ├── requirements.txt
 ├── 01-reactive/              反应式：模型自主循环
-├── 02-hybrid/                混合式：路由 + 两条分支
+├── 02-hybrid/                混合式：协调层 + 两条分支
 └── 03-deliberative/          深思熟虑：五阶段流水线
 ```
 
 `warehouse_data.py` 提供四套域数据（空间树、设备台账、档案台账、能源环境）、六个工具、
 职责范围预检与模型客户端。三个项目共用它，避免同一套台账写三遍导致口径漂移。
+
+## 架构要素与代码位置
+
+每个要素都能在代码里指到具体位置：
+
+| 架构 | 要素 | 代码位置 |
+|---|---|---|
+| 反应式 | 数据准备 | `warehouse_data.py`：`SPACE_TREE` / `DEVICE_DB` / `ARCHIVE_DB` / `STORAGE_ENV` |
+| 反应式 | 工具设计 | `warehouse_data.py`：六个 `@tool` |
+| 反应式 | 提示词模板 | `01-reactive`：`FORMAT_EXAMPLE` + `REACT_TEMPLATE` + `REACT_PROMPT` |
+| 反应式 | 输出解析器 | `01-reactive`：`ReActOutputParser` |
+| 反应式 | 执行循环 | `01-reactive`：`run_react_agent` |
+| 反应式 | 知识边界 | `warehouse_data.py` 的 `check_scope` 预检 + 工具非 0 响应码 + `01-reactive` 提示词约束 |
+| 混合式 | 协调层 | `02-hybrid`：`assess`，输出查询类型、处理模式、优先级三项 |
+| 混合式 | 反应式层快速响应 | `02-hybrid`：`reactive_agent` ⇄ `tools` |
+| 混合式 | 深思熟虑层数据收集 | `02-hybrid`：`collect_energy` |
+| 混合式 | 深思熟虑层深度分析 | `02-hybrid`：`analyze_energy` |
+| 混合式 | 深思熟虑层生成建议 | `02-hybrid`：`recommend` |
+| 混合式 | 响应生成 | `02-hybrid`：`make_answer` |
+| 深思熟虑 | Sensors | `03-deliberative`：`perception` |
+| 深思熟虑 | World Model / Memory | `03-deliberative`：`modeling` |
+| 深思熟虑 | Planner / Reasoner | `03-deliberative`：`reasoning` + `decide` |
+| 深思熟虑 | Actuators | `03-deliberative`：`write_report` |
 
 ## 六个工具
 

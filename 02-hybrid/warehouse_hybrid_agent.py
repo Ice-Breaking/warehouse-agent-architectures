@@ -3,14 +3,22 @@
 """
 库房大屏助手 - 混合式架构
 
-入口先用一次模型调用做路由分类，之后走两条完全不同的控制流：
+入口是协调层，用一次模型调用评估查询类型与优先级，之后按处理模式分派到两条控制流：
 
-    reactive       单目标查询。交回模型自主决定调哪个工具，代码只给工具集合与终止条件。
-    deliberative   跨库房对比分析。代码写死采集与对比两步，数据必须来自真实工具调用，
-                   模型只负责归纳，不得补充任何未出现的数字。
+    反应式层    emergency / informational 走这里。
+                交回模型自主决定调哪个工具，代码只给工具集合与终止条件。
+
+    深思熟虑层  analytical 走这里，代码写死三步，模型只在每步内部产出内容：
+                数据收集 collect_energy   真实调用工具取数，模型不参与
+                深度分析 analyze_energy   只做对比与异常定位，不给建议
+                生成建议 recommend        只给可执行动作，不重复分析结论
+
+    响应生成    make_answer 是两条分支的统一出口。
 
 与反应式的差别在于：反应式把控制流全程交给模型，混合式只对简单查询交出去，
 复杂请求改由代码编排，避免模型在多步采集里漏采或编数。
+
+优先级只影响答复语气，不参与分支选择，避免与处理模式互相打架。
 
 域数据、工具集合、职责边界与模型入口来自仓库根目录的 warehouse_data。
 
@@ -59,13 +67,22 @@ SYSTEM_PROMPT = """你是档案库房智慧大屏的值守助手，负责回答�
 4. 工具返回 code 非 0 时，如实转述失败原因，不得改写成成功。
 5. 工具没有返回的信息，回答"系统中未查询到"，不要用一般性经验补充。"""
 
-ROUTE_PROMPT = """判断下面这个问题该交给哪条链路处理，只回答一个单词，不要输出其他内容。
+ASSESS_PROMPT = """评估下面这个查询，只输出一个 JSON 对象，不要输出其他内容。
 
-reactive：单目标查询，一两次工具调用就能回答。例如某个库区在哪、某台设备什么状态、
-某份档案放在哪、某个库房的能耗或温湿度是多少。
+{{"query_type": "...", "processing_mode": "...", "priority": "..."}}
 
-deliberative：需要跨多个库房采集数据再做对比分析的请求。例如对比各库房能耗、
-全楼能耗排名、多个库房的环境差异、找出能耗异常或环境告警的库房。
+query_type 三选一：
+    emergency      设备告警、环境超标、门禁异常这类需要马上处置的现场问题
+    informational  查位置、查状态、查档号、查单个库房的能耗或温湿度
+    analytical     需要跨多个库房采集数据再做对比分析，例如对比各库房能耗、全楼能耗排名
+
+processing_mode 二选一：
+    reactive       emergency 与 informational 交给反应式层
+    deliberative   analytical 交给深思熟虑层
+
+priority 二选一：
+    high    涉及安全风险或设备离线，答复里要提示立即处置
+    normal  常规查询
 
 问题：{question}"""
 
@@ -94,7 +111,7 @@ Final Answer: 最终答复
 
 {scratchpad}"""
 
-COMPARE_PROMPT = """以下是系统真实采集到的库房数据，未经任何加工。
+ANALYZE_PROMPT = """以下是系统真实采集到的库房数据，未经任何加工。
 
 能耗数据（全楼汇总与各库房明细）：
 {energy_data}
@@ -104,10 +121,24 @@ COMPARE_PROMPT = """以下是系统真实采集到的库房数据，未经任何
 
 用户的问题是：{question}
 
-请基于以上数据回答，要求：
+请做深度分析，要求：
 1. 只能引用上面出现过的数字，不得补充、推算或编造任何未出现的数字。
-2. 明确指出能耗最高与最低的库房，以及存在环境告警的库房。
-3. 给出结论与可执行的建议，控制在 300 字以内。"""
+2. 明确指出能耗最高与最低的库房，以及存在环境告警的库房，并给出数值与超出范围。
+3. 指出异常点与线索，控制在 300 字以内。
+4. 本步只做对比与定位，不要给出整改建议，建议由下一环节单独产出。"""
+
+RECOMMEND_PROMPT = """以下是深度分析结论：
+
+{analysis}
+
+请为这一结论给出整改建议，要求：
+1. 每条建议必须是「动作 + 对象 + 复查条件」三件套，
+   例如"启动 3楼2号库房除湿机，24 小时后复查湿度是否回到 45-60%"。
+2. 建议控制在 3 条以内，按紧急程度排序。
+3. 不得复述分析结论，也不得引入分析中未出现过的数字、设备名或库房名。
+4. 优先级为 high 时，第一条建议必须是立即处置动作。
+
+当前优先级：{priority}"""
 
 
 class HybridState(TypedDict):
@@ -115,7 +146,9 @@ class HybridState(TypedDict):
 
     question: str
     history: str
-    route: str
+    query_type: str
+    processing_mode: str
+    priority: str
     steps: int
     scratchpad: str
     pending_tool: str
@@ -124,6 +157,7 @@ class HybridState(TypedDict):
     energy_data: str
     env_data: str
     analysis: str
+    recommendation: str
     answer: str
 
 
@@ -176,26 +210,52 @@ def _parse_tool_input(raw: str, text: str) -> Any:
         raise ValueError(f"Action Input 不是合法 JSON，原始内容：{cleaned}\n模型输出：\n{text}")
 
 
+def _parse_assess(raw: str) -> Tuple[str, str, str]:
+    """解析协调层的 JSON 输出，返回 (查询类型, 处理模式, 优先级)
+
+    模型可能用代码围栏包住 JSON，先剥围栏再截取首尾花括号之间的内容。
+    取值不合法时抛错，不设默认值兜底。
+    """
+    cleaned = raw.strip()
+    if cleaned.startswith("```"):
+        cleaned = re.sub(r"^```[a-zA-Z]*\s*", "", cleaned)
+        cleaned = re.sub(r"```\s*$", "", cleaned).strip()
+
+    start = cleaned.find("{")
+    end = cleaned.rfind("}")
+    if start == -1 or end == -1:
+        raise ValueError(f"协调层输出不是 JSON 对象，模型原始输出：\n{raw}")
+
+    try:
+        payload = json.loads(cleaned[start : end + 1])
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"协调层输出不是合法 JSON：{exc}\n模型原始输出：\n{raw}")
+
+    query_type = payload.get("query_type")
+    mode = payload.get("processing_mode")
+    priority = payload.get("priority")
+
+    if query_type not in ("emergency", "informational", "analytical"):
+        raise ValueError(f"query_type 取值 {query_type!r} 不合法，模型原始输出：\n{raw}")
+    if mode not in ("reactive", "deliberative"):
+        raise ValueError(f"processing_mode 取值 {mode!r} 不合法，模型原始输出：\n{raw}")
+    if priority not in ("high", "normal"):
+        raise ValueError(f"priority 取值 {priority!r} 不合法，模型原始输出：\n{raw}")
+
+    return query_type, mode, priority
+
+
 def assess(state: HybridState) -> dict:
-    """路由分类节点：判定问题走反应式还是固定分析流程"""
-    raw = _chat_with_system(SYSTEM_PROMPT, ROUTE_PROMPT.format(question=state["question"]))
-    lowered = raw.strip().lower()
-    print(f"[路由分类] {raw.strip()}")
-
-    # 不做静默降级：拿不到明确的分类就抛错，而不是默认走反应式
-    if "deliberative" in lowered and "reactive" not in lowered:
-        route = "deliberative"
-    elif "reactive" in lowered and "deliberative" not in lowered:
-        route = "reactive"
-    else:
-        raise ValueError(f"路由分类结果不是 reactive 或 deliberative，模型原始输出：\n{raw}")
-
-    return {"route": route}
+    """协调层：评估查询类型、处理模式与优先级，三项都校验通过才放行"""
+    raw = _chat_with_system(SYSTEM_PROMPT, ASSESS_PROMPT.format(question=state["question"]))
+    query_type, mode, priority = _parse_assess(raw)
+    print(f"[协调层] 类型={query_type} 模式={mode} 优先级={priority}")
+    return {"query_type": query_type, "processing_mode": mode, "priority": priority}
 
 
 def pick_route(state: HybridState) -> str:
-    """路由分支依据"""
-    return state["route"]
+    """分支只认处理模式，优先级不参与分支选择"""
+    return state["processing_mode"]
 
 
 def reactive_agent(state: HybridState) -> dict:
@@ -270,21 +330,34 @@ def collect_energy(state: HybridState) -> dict:
     return {"energy_data": energy, "env_data": env_data}
 
 
-def compare_energy(state: HybridState) -> dict:
-    """固定分析分支第二步：基于已采集的真实数据做对比"""
-    user_prompt = COMPARE_PROMPT.format(
+def analyze_energy(state: HybridState) -> dict:
+    """深思熟虑层第二步：深度分析，只做对比与异常定位，不给建议"""
+    user_prompt = ANALYZE_PROMPT.format(
         energy_data=state["energy_data"],
         env_data=state["env_data"],
         question=state["question"],
     )
     analysis = _chat_with_system(SYSTEM_PROMPT, user_prompt).strip()
-    print(f"\n[对比分析]\n{analysis}")
+    print(f"\n[深度分析]\n{analysis}")
     return {"analysis": analysis}
 
 
+def recommend(state: HybridState) -> dict:
+    """深思熟虑层第三步：生成建议，只给可执行动作，不重复分析结论"""
+    user_prompt = RECOMMEND_PROMPT.format(analysis=state["analysis"], priority=state["priority"])
+    recommendation = _chat_with_system(SYSTEM_PROMPT, user_prompt).strip()
+    print(f"\n[生成建议]\n{recommendation}")
+    return {"recommendation": recommendation}
+
+
 def make_answer(state: HybridState) -> dict:
-    """汇总最终答复"""
-    answer = state["final_answer"] if state["route"] == "reactive" else state["analysis"]
+    """两条分支的统一出口"""
+    if state["processing_mode"] == "reactive":
+        answer = state["final_answer"]
+    else:
+        answer = state["recommendation"]
+        if not answer:
+            raise RuntimeError("深思熟虑分支没有产出建议，不能拼凑答复")
     print(f"\n[Final Answer]\n{answer}")
     return {"answer": answer}
 
@@ -293,23 +366,25 @@ def make_answer(state: HybridState) -> dict:
 def build_graph():
     """组装混合式状态图
 
-    assess 只做一次分类，之后的路径是确定的：
-    reactive 分支保留模型自主循环，deliberative 分支是采集到对比的固定两步。
+    协调层只跑一次，之后的路径是确定的：
+    反应式层保留模型自主循环，深思熟虑层是数据收集到深度分析到生成建议的固定三步。
     """
     workflow = StateGraph(HybridState)
     workflow.add_node("assess", assess)
     workflow.add_node("reactive_agent", reactive_agent)
     workflow.add_node("tools", execute_tools)
     workflow.add_node("collect_energy", collect_energy)
-    workflow.add_node("compare_energy", compare_energy)
+    workflow.add_node("analyze_energy", analyze_energy)
+    workflow.add_node("recommend", recommend)
     workflow.add_node("make_answer", make_answer)
 
     workflow.set_entry_point("assess")
     workflow.add_conditional_edges("assess", pick_route, {"reactive": "reactive_agent", "deliberative": "collect_energy"})
     workflow.add_conditional_edges("reactive_agent", after_reactive, {"answer": "make_answer", "tools": "tools"})
     workflow.add_edge("tools", "reactive_agent")
-    workflow.add_edge("collect_energy", "compare_energy")
-    workflow.add_edge("compare_energy", "make_answer")
+    workflow.add_edge("collect_energy", "analyze_energy")
+    workflow.add_edge("analyze_energy", "recommend")
+    workflow.add_edge("recommend", "make_answer")
     workflow.add_edge("make_answer", END)
 
     return workflow.compile()
@@ -333,7 +408,9 @@ def run_hybrid_agent(question: str, history: Optional[List[Tuple[str, str]]] = N
     initial: HybridState = {
         "question": question,
         "history": _format_history(history or []),
-        "route": "",
+        "query_type": "",
+        "processing_mode": "",
+        "priority": "",
         "steps": 0,
         "scratchpad": "",
         "pending_tool": "",
@@ -342,6 +419,7 @@ def run_hybrid_agent(question: str, history: Optional[List[Tuple[str, str]]] = N
         "energy_data": "",
         "env_data": "",
         "analysis": "",
+        "recommendation": "",
         "answer": "",
     }
     result = build_graph().invoke(initial)
