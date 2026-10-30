@@ -90,7 +90,7 @@ warehouse-agent-architectures/
 重构时规格层几乎不动，特征层负责兜底，防止行为悄悄漂移。
 
 ```bash
-python3 -m pytest                  # 全部，约 136 项，秒级
+python3 -m pytest                  # 全部，约 154 项，秒级
 python3 -m pytest tests/specs      # 确定性规格，不需要任何模型访问
 python3 -m pytest -m recorded      # 录制回放
 ```
@@ -102,7 +102,7 @@ python3 -m pytest -m recorded      # 录制回放
 
 | 层 | 覆盖 |
 |---|---|
-| 规格层 | 域数据自洽性、六个工具合约、知识边界、ReAct 解析协议、协调层三元组、两张图结构、提示词与参数对应 |
+| 规格层 | 域数据自洽性、六个工具合约、知识边界、ReAct 解析协议、协调层三元组、两张图结构、提示词与参数对应、公共模块复用片段 |
 | 特征层 | 反应式工具循环、混合式两条分支、深思熟虑五阶段、录制回放 |
 
 ## 六个工具

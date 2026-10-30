@@ -6,7 +6,7 @@
 ## 怎么跑
 
 ```bash
-python3 -m pytest                  # 全部，约 136 项，秒级
+python3 -m pytest                  # 全部，约 154 项，秒级
 python3 -m pytest tests/specs      # 只跑确定性规格，不需要任何模型访问
 python3 -m pytest tests/characterization
 python3 -m pytest -m recorded      # 只跑录制回放
@@ -117,6 +117,24 @@ assert "Observation" in client.requests[1][0]["content"]   # 第二轮看到了�
 
 两步锁住：占位符集合等于期望集合，再用占位值渲染一遍验证自洽。
 另外锁住边界条款必须写进提示词——工具层兜底挡不住模型自己编造。
+
+### 八、公共模块的复用片段　`test_shared_spec.py`
+
+重构把三个项目间的重复实现上提到了 `warehouse_data`。它们是三个架构共同
+依赖的契约，单独锁一层——改一处会影响三条链路，靠特征层间接发现太晚。
+
+| 规格 | 要点 |
+|---|---|
+| `MAX_ROUNDS` / `HISTORY_WINDOW` | 特征值 6 与 5，特征测试里的轮次断言依赖它们 |
+| `collect_environment_all` | 覆盖全部 5 个库房，返回工具原文而非解析后的结构 |
+| `format_history` | 空历史返回占位、只保留最近窗口、发言带角色标签 |
+| `guard_scope` | 领域内返回 None；越界返回 `check_scope` 的固定话术而非另编一段；label 透传说明跳过的是哪条链路 |
+| `strip_fence` | 剥代码围栏，无围栏时原样返回 |
+| `parse_tool_input` | JSON 解析、单参数标量回退、残缺 JSON 抛错 |
+| `run_cli` | 退出词终止、历史按轮累积传给 handler、handler 抛错不中断会话 |
+
+其中 `run_cli` 用 `monkeypatch` 替换 `builtins.input` 来驱动，
+不真的占用标准输入。
 
 ## 特征清单
 
