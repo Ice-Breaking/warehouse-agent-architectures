@@ -26,10 +26,9 @@ langchain 1.x 已移除 AgentExecutor，因此执行环节按 ReAct 协议自行
 """
 
 import json
-import re
 import sys
 from pathlib import Path
-from typing import Any, List, Tuple, Union
+from typing import List, Tuple, Union
 
 from langchain_core.agents import AgentAction, AgentFinish
 from langchain_core.output_parsers import BaseOutputParser
@@ -39,7 +38,7 @@ from pydantic import ValidationError
 # 允许在仓库根目录或本项目目录下直接运行
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from warehouse_data import TOOL_MAP, _chat, build_tool_descriptions, check_scope, LLM_MODEL
+import warehouse_data as wd
 
 
 # ==========================================================================
@@ -91,12 +90,10 @@ REACT_TEMPLATE = """你是档案库房智慧大屏的值守助手，负责回答
 
 REACT_PROMPT = PromptTemplate.from_template(REACT_TEMPLATE)
 
-_FINAL_ANSWER_PATTERN = re.compile(r"Final\s*Answer\s*[:：]\s*(.*)", re.IGNORECASE | re.DOTALL)
-_ACTION_PATTERN = re.compile(r"Action\s*[:：]\s*([A-Za-z_][A-Za-z0-9_]*)", re.IGNORECASE)
-_ACTION_INPUT_PATTERN = re.compile(r"Action\s*Input\s*[:：]\s*(.*)", re.IGNORECASE | re.DOTALL)
-
-
 # 输出解析器：把模型文本解析为 AgentAction 或 AgentFinish
+#
+# 解析规则在 warehouse_data 的 parse_react_output，这里只把结果转成 langchain 的
+# AgentAction / AgentFinish。反应式与混合式共用同一份规则，避免两边各写一套。
 class ReActOutputParser(BaseOutputParser[Union[AgentAction, AgentFinish]]):
     """解析 ReAct 文本输出，产出 AgentAction 或 AgentFinish。
 
@@ -108,89 +105,47 @@ class ReActOutputParser(BaseOutputParser[Union[AgentAction, AgentFinish]]):
         return "react"
 
     def parse(self, text: str) -> Union[AgentAction, AgentFinish]:
-        # 模型常把关键字写成 **Action:**，去掉加粗标记后再匹配
-        text = text.replace("**", "")
-        final_match = _FINAL_ANSWER_PATTERN.search(text)
-        if final_match:
-            answer = final_match.group(1).strip()
-            if not answer:
-                raise ValueError(f"Final Answer 内容为空，模型原始输出：\n{text}")
-            return AgentFinish(return_values={"output": answer}, log=text)
-
-        action_match = _ACTION_PATTERN.search(text)
-        if not action_match:
-            raise ValueError(
-                "模型输出既没有 Action 也没有 Final Answer，无法继续执行。"
-                f"请检查提示词与模型输出。原始输出：\n{text}"
-            )
-
-        input_match = _ACTION_INPUT_PATTERN.search(text)
-        if not input_match:
-            raise ValueError(f"模型输出了 Action 但缺少 Action Input，原始输出：\n{text}")
-
-        tool_input = self._parse_tool_input(input_match.group(1).strip(), text)
-        return AgentAction(tool=action_match.group(1).strip(), tool_input=tool_input, log=text)
-
-    @staticmethod
-    def _parse_tool_input(raw: str, text: str) -> Any:
-        """Action Input 统一按 JSON 对象解析，去掉代码围栏后再解析"""
-        cleaned = raw.strip()
-        if cleaned.startswith("```"):
-            cleaned = re.sub(r"^```[a-zA-Z]*\s*", "", cleaned)
-            cleaned = re.sub(r"```\s*$", "", cleaned).strip()
-        try:
-            return json.loads(cleaned)
-        except json.JSONDecodeError:
-            # 单参数工具允许直接给标量文本
-            if cleaned and "{" not in cleaned:
-                return cleaned
-            raise ValueError(f"Action Input 不是合法 JSON，原始内容：{cleaned}\n模型输出：\n{text}")
+        kind, payload = wd.parse_react_output(text)
+        if kind == "finish":
+            return AgentFinish(return_values={"output": payload}, log=text)
+        tool_name, tool_input = payload
+        return AgentAction(tool=tool_name, tool_input=tool_input, log=text)
 
 
 def _execute_tool(action: AgentAction) -> str:
     """执行工具，把参数错误回灌给模型自纠，工具内部的硬错误照常抛出"""
-    tool_item = TOOL_MAP.get(action.tool)
+    tool_item = wd.TOOL_MAP.get(action.tool)
     if tool_item is None:
-        return f"工具 {action.tool} 不存在，可用工具：{', '.join(TOOL_MAP)}"
+        return f"工具 {action.tool} 不存在，可用工具：{', '.join(wd.TOOL_MAP)}"
     try:
         return str(tool_item.invoke(action.tool_input))
     except ValidationError as exc:
         return f"参数不合法，请按工具参数名重新调用。错误详情：{exc}"
 
 
-def _format_history(history: List[Tuple[str, str]]) -> str:
-    """把多轮历史拼成提示词片段，只保留最近五轮"""
-    if not history:
-        return "无"
-    recent = history[-5:]
-    return "\n".join(f"用户：{asked}\n助手：{answered}" for asked, answered in recent)
-
-
 # 执行循环：调用模型 -> 解析 -> 执行工具 -> 回灌观察，直到 AgentFinish 或超过轮次上限
 def run_react_agent(question: str, history: List[Tuple[str, str]], max_iterations: int = 6) -> str:
     """执行一次反应式推理，返回最终答复"""
-    scope_reply = check_scope(question)
+    scope_reply = wd.guard_scope(question, "直接答复，不进入工具循环")
     if scope_reply is not None:
-        print("[边界预检] 命中职责范围外话题，直接答复，不进入工具循环")
-        print(f"[Final Answer]\n{scope_reply}")
         return scope_reply
 
     parser = ReActOutputParser()
-    tool_descriptions = build_tool_descriptions()
-    history_text = _format_history(history)
+    tool_descriptions = wd.build_tool_descriptions()
+    history_text = wd.format_history(history)
     scratchpad = ""
     raw = ""
 
     for step in range(1, max_iterations + 1):
         prompt = REACT_PROMPT.format(
             tool_descriptions=tool_descriptions,
-            tool_names=", ".join(TOOL_MAP),
+            tool_names=", ".join(wd.TOOL_MAP),
             format_example=FORMAT_EXAMPLE,
             history=history_text,
             question=question,
             agent_scratchpad=scratchpad,
         )
-        raw = _chat(prompt)
+        raw = wd.chat(prompt)
         print(f"\n[第 {step} 轮模型输出]\n{raw.strip()}")
 
         parsed = parser.parse(raw)
@@ -208,35 +163,18 @@ def run_react_agent(question: str, history: List[Tuple[str, str]], max_iteration
 
 
 def main() -> None:
-    print("=== 库房大屏助手（反应式）===")
-    print(f"模型：{LLM_MODEL}")
-    print("可查询：空间位置、设备状态与控制、档案存放位置、库房能源环境")
-    print("示例：3楼2号库房的低氧库区在什么位置")
-    print("示例：把3楼2号库房V6库区的断路器分闸")
-    print("示例：查一下题名带决算的档案放在哪")
-    print("示例：3楼2号库房这个月的能耗是多少")
-    print("输入 退出 结束会话\n")
-
-    history: List[Tuple[str, str]] = []
-    while True:
-        try:
-            question = input("请输入问题：").strip()
-        except (EOFError, KeyboardInterrupt):
-            print("\n已退出")
-            break
-
-        if not question:
-            continue
-        if question.lower() in ("退出", "exit", "quit"):
-            print("已退出")
-            break
-
-        try:
-            answer = run_react_agent(question, history)
-            history.append((question, answer))
-        except Exception as exc:
-            print(f"\n[执行失败] {exc}")
-        print("-" * 60)
+    wd.run_cli(
+        "反应式",
+        run_react_agent,
+        lines=(
+            "可查询：空间位置、设备状态与控制、档案存放位置、库房能源环境",
+            "示例：3楼2号库房的低氧库区在什么位置",
+            "示例：把3楼2号库房V6库区的断路器分闸",
+            "示例：查一下题名带决算的档案放在哪",
+            "示例：3楼2号库房这个月的能耗是多少",
+        ),
+        with_history=True,
+    )
 
 
 if __name__ == "__main__":

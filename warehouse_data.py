@@ -28,6 +28,12 @@ DASHSCOPE_API_KEY = os.getenv("DASHSCOPE_API_KEY")
 LLM_BASE_URL = os.getenv("LLM_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1")
 LLM_MODEL = os.getenv("LLM_MODEL", "qwen3.8-27b")
 
+# 反应式分支允许的最大工具调用轮次，超过即抛错，不靠框架的递归上限兜底
+MAX_ROUNDS = 6
+
+# 多轮会话里保留进提示词的最近轮数
+HISTORY_WINDOW = 5
+
 
 # ==========================================================================
 # 数据准备
@@ -867,6 +873,99 @@ def build_tool_descriptions() -> str:
 
 
 # ==========================================================================
+# 复用片段
+#
+# 三个架构都会用到的采集与格式化逻辑集中在这里，避免各写一份导致口径漂移。
+# ==========================================================================
+
+
+def collect_environment_all() -> List[str]:
+    """逐个库房采集真实环境数据，返回工具返回的原文列表
+
+    混合式与深思熟虑都要全楼环境数据，采集方式必须一致，否则两边口径会漂移。
+    返回工具的原始输出而不是解析后的结构，保证下游引用的数字与工具结果逐字一致。
+    """
+    snippets: List[str] = []
+    for key in STORAGE_ENV:
+        floor_no, name = key.split("-", 1)
+        snippets.append(str(query_environment.invoke({"storage_name": f"{floor_no}楼{name}"})))
+    return snippets
+
+
+def format_history(history: List[Tuple[str, str]]) -> str:
+    """把多轮历史拼成提示词片段，只保留最近若干轮
+
+    轮数由 HISTORY_WINDOW 控制：全量塞进提示词既浪费 token，
+    也会让早期无关内容干扰当前判断。
+    """
+    if not history:
+        return "无"
+    recent = history[-HISTORY_WINDOW:]
+    return "\n".join(f"用户：{asked}\n助手：{answered}" for asked, answered in recent)
+
+
+# ReAct 协议的三条解析规则：最终答案、动作名、动作入参。
+# 冒号同时认中英文两种，因为模型两种都会写。
+_FINAL_ANSWER_PATTERN = re.compile(r"Final\s*Answer\s*[:：]\s*(.*)", re.IGNORECASE | re.DOTALL)
+_ACTION_PATTERN = re.compile(r"Action\s*[:：]\s*([A-Za-z_][A-Za-z0-9_]*)", re.IGNORECASE)
+_ACTION_INPUT_PATTERN = re.compile(r"Action\s*Input\s*[:：]\s*(.*)", re.IGNORECASE | re.DOTALL)
+
+
+def strip_fence(text: str) -> str:
+    """剥掉模型输出里的代码围栏
+
+    模型常把 JSON 包在 ```json 里，解析前必须先剥掉。
+    """
+    cleaned = text.strip()
+    if cleaned.startswith("```"):
+        cleaned = re.sub(r"^```[a-zA-Z]*\s*", "", cleaned)
+        cleaned = re.sub(r"```\s*$", "", cleaned).strip()
+    return cleaned
+
+
+def parse_tool_input(raw: str, text: str) -> Any:
+    """Action Input 按 JSON 对象解析，剥掉代码围栏后解析失败再退回标量"""
+    cleaned = strip_fence(raw)
+    try:
+        return json.loads(cleaned)
+    except json.JSONDecodeError:
+        if cleaned and "{" not in cleaned:
+            return cleaned
+        raise ValueError(f"Action Input 不是合法 JSON，原始内容：{cleaned}\n模型输出：\n{text}")
+
+
+def parse_react_output(text: str) -> Tuple[str, Any]:
+    """解析 ReAct 协议输出，返回 ("finish", 答复) 或 ("action", (工具名, 参数))
+
+    认不出时抛错并带上原文，不做静默降级猜测：静默降级会让链路悄悄跑偏，
+    错误暴露在当场才好排查。
+    """
+    # 模型常把关键字写成 **Action:**，去掉加粗标记后再匹配
+    cleaned = text.replace("**", "")
+
+    final_match = _FINAL_ANSWER_PATTERN.search(cleaned)
+    if final_match:
+        answer = final_match.group(1).strip()
+        if not answer:
+            raise ValueError(f"Final Answer 内容为空，模型原始输出：\n{text}")
+        return "finish", answer
+
+    action_match = _ACTION_PATTERN.search(cleaned)
+    if not action_match:
+        raise ValueError(
+            "模型输出既没有 Action 也没有 Final Answer，无法继续执行。"
+            f"请检查提示词与模型输出。原始输出：\n{text}"
+        )
+
+    input_match = _ACTION_INPUT_PATTERN.search(cleaned)
+    if not input_match:
+        raise ValueError(f"模型输出了 Action 但缺少 Action Input，原始输出：\n{text}")
+
+    tool_input = parse_tool_input(input_match.group(1).strip(), text)
+    return "action", (action_match.group(1).strip(), tool_input)
+
+
+# ==========================================================================
 # 知识边界
 #
 # 三层防线：
@@ -906,6 +1005,21 @@ def check_scope(question: str) -> Optional[str]:
     return None
 
 
+def guard_scope(question: str, label: str) -> Optional[str]:
+    """三个架构共用的入口预检：命中越界话题时打印固定话术并返回，未命中返回 None
+
+    label 说明这次拦截发生在哪条链路上，例如「不进入工具循环」。
+    抽出来是为了让三条链路的拦截行为完全一致：命中就打印、就返回固定话术、
+    就终止，不会有一条链路悄悄放行。
+    """
+    reply = check_scope(question)
+    if reply is None:
+        return None
+    print(f"[边界预检] 命中职责范围外话题，{label}")
+    print(f"[Final Answer]\n{reply}")
+    return reply
+
+
 # ==========================================================================
 # 模型入口
 #
@@ -922,7 +1036,7 @@ def _build_client() -> OpenAI:
     return OpenAI(api_key=DASHSCOPE_API_KEY, base_url=LLM_BASE_URL, max_retries=0)
 
 
-def _chat(prompt: str) -> str:
+def chat(prompt: str) -> str:
     """发起一次对话，返回模型输出的文本
 
     temperature=0 保证输出格式与 JSON 参数稳定；
@@ -935,3 +1049,76 @@ def _chat(prompt: str) -> str:
         extra_body={"enable_thinking": False},
     )
     return response.choices[0].message.content or ""
+
+
+def chat_with_system(system: str, user: str) -> str:
+    """发起一次带 system 角色的对话，返回模型输出文本
+
+    角色与知识边界放在 system 中，与每轮的 user 内容分离，
+    避免多轮之后角色被冲淡。
+    """
+    response = _build_client().chat.completions.create(
+        model=LLM_MODEL,
+        messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
+        temperature=0,
+        extra_body={"enable_thinking": False},
+    )
+    return response.choices[0].message.content or ""
+
+
+# ==========================================================================
+# 交互入口
+#
+# 三个架构的命令行循环完全一致，差异只在开场说明与处理函数，
+# 因此把循环本身收在这里，各项目只提供自己的说明文案与入口函数。
+# ==========================================================================
+
+
+def run_cli(
+    title: str,
+    handler,
+    lines: Tuple[str, ...] = (),
+    prompt: str = "请输入问题：",
+    with_history: bool = False,
+) -> None:
+    """统一的命令行交互循环
+
+    title        架构名，显示在标题栏
+    handler      处理一次请求的可调用对象
+    lines        开场后逐行打印的说明与示例
+    prompt       输入提示符
+    with_history 是否把历史传给 handler
+
+    handler 的签名随 with_history 变化：
+        True    handler(question, history) -> 答复，答复会被记入历史
+        False   handler(question)，多用于产出报告这类不需要多轮的场景
+    """
+    print(f"=== 库房大屏助手（{title}）===")
+    print(f"模型：{LLM_MODEL}")
+    for line in lines:
+        print(line)
+    print("输入 退出 结束会话\n")
+
+    history: List[Tuple[str, str]] = []
+    while True:
+        try:
+            question = input(prompt).strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\n已退出")
+            break
+
+        if not question:
+            continue
+        if question.lower() in ("退出", "exit", "quit"):
+            print("已退出")
+            break
+
+        try:
+            if with_history:
+                answer = handler(question, history)
+                history.append((question, answer))
+            else:
+                handler(question)
+        except Exception as exc:
+            print(f"\n[执行失败] {exc}")
+        print("-" * 60)

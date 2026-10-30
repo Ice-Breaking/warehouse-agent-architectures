@@ -41,15 +41,25 @@ python 03-deliberative/warehouse_deliberative_agent.py
 
 ```
 warehouse-agent-architectures/
-├── warehouse_data.py         三个项目共用的域数据、工具与模型入口
+├── warehouse_data.py         三个项目共用的域数据、工具、复用片段与模型入口
 ├── requirements.txt
+├── pytest.ini
+├── tests/
+│   ├── SPEC.md               规格目录：每条契约对应哪些断言
+│   ├── conftest.py           sys.path 引导与假客户端装配
+│   ├── fakes.py              脚本化假模型客户端
+│   ├── record.py             采集真实响应到 recordings/
+│   ├── recordings/           四个场景的录制件，随代码入库
+│   ├── specs/                确定性规格，不涉及模型
+│   └── characterization/     特征测试与录制回放
 ├── 01-reactive/              反应式：模型自主循环
 ├── 02-hybrid/                混合式：协调层 + 两条分支
 └── 03-deliberative/          深思熟虑：五阶段流水线
 ```
 
 `warehouse_data.py` 提供四套域数据（空间树、设备台账、档案台账、能源环境）、六个工具、
-职责范围预检与模型客户端。三个项目共用它，避免同一套台账写三遍导致口径漂移。
+职责范围预检、ReAct 解析、环境采集与历史格式化等复用片段，以及模型客户端与交互入口。
+三个项目共用它，避免同一套台账或解析规则写三遍导致口径漂移。
 
 ## 架构要素与代码位置
 
@@ -73,6 +83,27 @@ warehouse-agent-architectures/
 | 深思熟虑 | World Model / Memory | `03-deliberative`：`modeling` |
 | 深思熟虑 | Planner / Reasoner | `03-deliberative`：`reasoning` + `decide` |
 | 深思熟虑 | Actuators | `03-deliberative`：`write_report` |
+
+## 测试与规格
+
+三个项目的行为用两层测试锁住：规格层记录「应该如此」，特征层记录「目前如此」。
+重构时规格层几乎不动，特征层负责兜底，防止行为悄悄漂移。
+
+```bash
+python3 -m pytest                  # 全部，约 136 项，秒级
+python3 -m pytest tests/specs      # 确定性规格，不需要任何模型访问
+python3 -m pytest -m recorded      # 录制回放
+```
+
+模型访问由脚本化的假客户端替代，测试不联网、不消耗额度。真实语料另有录制件
+在 `tests/recordings/`，由 `python tests/record.py` 采集，回放时只断言结构事实。
+
+完整规格目录见 [`tests/SPEC.md`](tests/SPEC.md)。
+
+| 层 | 覆盖 |
+|---|---|
+| 规格层 | 域数据自洽性、六个工具合约、知识边界、ReAct 解析协议、协调层三元组、两张图结构、提示词与参数对应 |
+| 特征层 | 反应式工具循环、混合式两条分支、深思熟虑五阶段、录制回放 |
 
 ## 六个工具
 

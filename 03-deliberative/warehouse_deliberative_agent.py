@@ -41,15 +41,7 @@ from langgraph.graph import END, StateGraph
 # 允许在仓库根目录或本项目目录下直接运行
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from warehouse_data import (
-    STORAGE_ENV,
-    _build_client,
-    check_scope,
-    query_device_status,
-    query_energy_stat,
-    query_environment,
-    LLM_MODEL,
-)
+import warehouse_data as wd
 
 SYSTEM_PROMPT = """你是档案库房智慧大屏的值守助手，负责把巡检数据整理成可执行的结论。
 
@@ -123,29 +115,15 @@ class DelibState(TypedDict):
     report: str
 
 
-def _chat_with_system(system: str, user: str) -> str:
-    """发起一次带 system 角色的对话，返回模型输出文本"""
-    response = _build_client().chat.completions.create(
-        model=LLM_MODEL,
-        messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
-        temperature=0,
-        extra_body={"enable_thinking": False},
-    )
-    return response.choices[0].message.content or ""
-
-
 def perception(state: DelibState) -> dict:
     """第一阶段：代码调用真实工具采集数据，模型不参与
 
     这一步是整条流水线可信度的基础：后续所有阶段只能引用这里采集到的原文。
     """
-    devices = str(query_device_status.invoke({"keyword": ""}))
-    energy = str(query_energy_stat.invoke({"storage_name": "全部"}))
+    devices = str(wd.query_device_status.invoke({"keyword": ""}))
+    energy = str(wd.query_energy_stat.invoke({"storage_name": "全部"}))
 
-    env_snippets = []
-    for key in STORAGE_ENV:
-        floor_no, name = key.split("-", 1)
-        env_snippets.append(str(query_environment.invoke({"storage_name": f"{floor_no}楼{name}"})))
+    env_snippets = wd.collect_environment_all()
 
     perception_text = (
         f"【设备台账】\n{devices}\n\n"
@@ -159,21 +137,21 @@ def perception(state: DelibState) -> dict:
 
 def modeling(state: DelibState) -> dict:
     """第二阶段：把原始数据整理成风险矩阵"""
-    risk_model = _chat_with_system(SYSTEM_PROMPT, MODELING_PROMPT.format(perception=state["perception"])).strip()
+    risk_model = wd.chat_with_system(SYSTEM_PROMPT, MODELING_PROMPT.format(perception=state["perception"])).strip()
     print(f"\n[阶段 2/5 建模]\n{risk_model}")
     return {"risk_model": risk_model}
 
 
 def reasoning(state: DelibState) -> dict:
     """第三阶段：提出三套整改方案"""
-    plans = _chat_with_system(SYSTEM_PROMPT, REASONING_PROMPT.format(risk_model=state["risk_model"])).strip()
+    plans = wd.chat_with_system(SYSTEM_PROMPT, REASONING_PROMPT.format(risk_model=state["risk_model"])).strip()
     print(f"\n[阶段 3/5 推理]\n{plans}")
     return {"plans": plans}
 
 
 def decide(state: DelibState) -> dict:
     """第四阶段：选定一套方案并说明取舍"""
-    decision = _chat_with_system(
+    decision = wd.chat_with_system(
         SYSTEM_PROMPT,
         DECISION_PROMPT.format(risk_model=state["risk_model"], plans=state["plans"]),
     ).strip()
@@ -183,7 +161,7 @@ def decide(state: DelibState) -> dict:
 
 def write_report(state: DelibState) -> dict:
     """第五阶段：成文"""
-    report = _chat_with_system(
+    report = wd.chat_with_system(
         SYSTEM_PROMPT,
         REPORT_PROMPT.format(
             question=state["question"],
@@ -221,10 +199,8 @@ def build_graph():
 
 def run_deliberative_agent(question: str) -> str:
     """执行一次深思熟虑推理，返回巡检报告全文"""
-    scope_reply = check_scope(question)
+    scope_reply = wd.guard_scope(question, "直接答复，不进入流水线")
     if scope_reply is not None:
-        print("[边界预检] 命中职责范围外话题，直接答复，不进入流水线")
-        print(f"[Final Answer]\n{scope_reply}")
         return scope_reply
 
     initial: DelibState = {
@@ -240,30 +216,15 @@ def run_deliberative_agent(question: str) -> str:
 
 
 def main() -> None:
-    print("=== 库房大屏助手（深思熟虑）===")
-    print(f"模型：{LLM_MODEL}")
-    print("按固定五阶段生成巡检报告：感知 -> 建模 -> 推理 -> 决策 -> 成文")
-    print("示例：生成一份全楼库房的季度巡检报告")
-    print("输入 退出 结束会话\n")
-
-    while True:
-        try:
-            question = input("请输入巡检诉求：").strip()
-        except (EOFError, KeyboardInterrupt):
-            print("\n已退出")
-            break
-
-        if not question:
-            continue
-        if question.lower() in ("退出", "exit", "quit"):
-            print("已退出")
-            break
-
-        try:
-            run_deliberative_agent(question)
-        except Exception as exc:
-            print(f"\n[执行失败] {exc}")
-        print("-" * 60)
+    wd.run_cli(
+        "深思熟虑",
+        run_deliberative_agent,
+        lines=(
+            "按固定五阶段生成巡检报告：感知 -> 建模 -> 推理 -> 决策 -> 成文",
+            "示例：生成一份全楼库房的季度巡检报告",
+        ),
+        prompt="请输入巡检诉求：",
+    )
 
 
 if __name__ == "__main__":

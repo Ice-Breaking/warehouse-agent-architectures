@@ -1,0 +1,10 @@
+{
+  "scenario": "hybrid_reactive",
+  "question": "2楼1号库房有没有防磁库区",
+  "model": "qwen3.8-27b",
+  "responses": [
+    "{\n  \"query_type\": \"informational\",\n  \"processing_mode\": \"reactive\",\n  \"priority\": \"normal\"\n}",
+    "Thought: 用户询问2楼1号库房是否有防磁库区，这是一个空间位置查询。我需要调用resolve_scene_target工具来解析这个位置描述，查看系统中是否存在该库区。\nAction: resolve_scene_target\nAction Input: {\"target_text\": \"2楼1号库房防磁库区\"}",
+    "Thought: 工具返回 code 为 0，且 data 中明确包含 \"zone\": \"防磁库区\" 和完整路径 \"档案综合楼/二层/1号库房/防磁库区\"，说明该位置存在。我可以据此回答用户。\nFinal Answer: 有的。2楼（二层）1号库房设有防磁库区，其标准路径为：档案综合楼/二层/1号库房/防磁库区，该库区内包含密集架编号 2-1-03。"
+  ]
+}

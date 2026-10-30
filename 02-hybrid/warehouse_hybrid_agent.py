@@ -28,7 +28,6 @@
 """
 
 import json
-import re
 import sys
 from functools import lru_cache
 from pathlib import Path
@@ -39,23 +38,7 @@ from langgraph.graph import END, StateGraph
 # 允许在仓库根目录或本项目目录下直接运行
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from warehouse_data import (
-    STORAGE_ENV,
-    TOOL_MAP,
-    _build_client,
-    build_tool_descriptions,
-    check_scope,
-    query_energy_stat,
-    query_environment,
-    LLM_MODEL,
-)
-
-# 反应式分支的最大工具调用轮次，超过即抛错，不靠框架的递归上限兜底
-MAX_REACTIVE_STEPS = 6
-
-_FINAL_ANSWER_PATTERN = re.compile(r"Final\s*Answer\s*[:：]\s*(.*)", re.IGNORECASE | re.DOTALL)
-_ACTION_PATTERN = re.compile(r"Action\s*[:：]\s*([A-Za-z_][A-Za-z0-9_]*)", re.IGNORECASE)
-_ACTION_INPUT_PATTERN = re.compile(r"Action\s*Input\s*[:：]\s*(.*)", re.IGNORECASE | re.DOTALL)
+import warehouse_data as wd
 
 # 角色与知识边界放在 system 中，与每轮的 user 内容分离，避免多轮后角色被冲淡
 SYSTEM_PROMPT = """你是档案库房智慧大屏的值守助手，负责回答四类问题：空间位置查询、设备状态与控制、档案存放位置检索、库房能源环境。
@@ -161,65 +144,13 @@ class HybridState(TypedDict):
     answer: str
 
 
-def _chat_with_system(system: str, user: str) -> str:
-    """发起一次带 system 角色的对话，返回模型输出文本"""
-    response = _build_client().chat.completions.create(
-        model=LLM_MODEL,
-        messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
-        temperature=0,
-        extra_body={"enable_thinking": False},
-    )
-    return response.choices[0].message.content or ""
-
-
-def _parse_output(text: str) -> Tuple[str, Any]:
-    """解析模型输出，返回 ("finish", 答复) 或 ("action", (工具名, 参数))
-
-    解析不出时抛异常并附带原文，不做静默猜测。
-    """
-    cleaned = text.replace("**", "")
-    final_match = _FINAL_ANSWER_PATTERN.search(cleaned)
-    if final_match:
-        answer = final_match.group(1).strip()
-        if not answer:
-            raise ValueError(f"Final Answer 内容为空，模型原始输出：\n{text}")
-        return "finish", answer
-
-    action_match = _ACTION_PATTERN.search(cleaned)
-    if not action_match:
-        raise ValueError(f"模型输出既没有 Action 也没有 Final Answer，原始输出：\n{text}")
-
-    input_match = _ACTION_INPUT_PATTERN.search(cleaned)
-    if not input_match:
-        raise ValueError(f"模型输出了 Action 但缺少 Action Input，原始输出：\n{text}")
-
-    return "action", (action_match.group(1).strip(), _parse_tool_input(input_match.group(1).strip(), text))
-
-
-def _parse_tool_input(raw: str, text: str) -> Any:
-    """Action Input 按 JSON 对象解析，去掉代码围栏后解析失败再退回标量"""
-    cleaned = raw.strip()
-    if cleaned.startswith("```"):
-        cleaned = re.sub(r"^```[a-zA-Z]*\s*", "", cleaned)
-        cleaned = re.sub(r"```\s*$", "", cleaned).strip()
-    try:
-        return json.loads(cleaned)
-    except json.JSONDecodeError:
-        if cleaned and "{" not in cleaned:
-            return cleaned
-        raise ValueError(f"Action Input 不是合法 JSON，原始内容：{cleaned}\n模型输出：\n{text}")
-
-
 def _parse_assess(raw: str) -> Tuple[str, str, str]:
     """解析协调层的 JSON 输出，返回 (查询类型, 处理模式, 优先级)
 
     模型可能用代码围栏包住 JSON，先剥围栏再截取首尾花括号之间的内容。
     取值不合法时抛错，不设默认值兜底。
     """
-    cleaned = raw.strip()
-    if cleaned.startswith("```"):
-        cleaned = re.sub(r"^```[a-zA-Z]*\s*", "", cleaned)
-        cleaned = re.sub(r"```\s*$", "", cleaned).strip()
+    cleaned = wd.strip_fence(raw)
 
     start = cleaned.find("{")
     end = cleaned.rfind("}")
@@ -247,7 +178,7 @@ def _parse_assess(raw: str) -> Tuple[str, str, str]:
 
 def assess(state: HybridState) -> dict:
     """协调层：评估查询类型、处理模式与优先级，三项都校验通过才放行"""
-    raw = _chat_with_system(SYSTEM_PROMPT, ASSESS_PROMPT.format(question=state["question"]))
+    raw = wd.chat_with_system(SYSTEM_PROMPT, ASSESS_PROMPT.format(question=state["question"]))
     query_type, mode, priority = _parse_assess(raw)
     print(f"[协调层] 类型={query_type} 模式={mode} 优先级={priority}")
     return {"query_type": query_type, "processing_mode": mode, "priority": priority}
@@ -260,21 +191,21 @@ def pick_route(state: HybridState) -> str:
 
 def reactive_agent(state: HybridState) -> dict:
     """反应式分支：模型自主决定下一步，代码只负责解析与回灌"""
-    if state["steps"] >= MAX_REACTIVE_STEPS:
-        raise RuntimeError(f"反应式分支已调用 {state['steps']} 轮工具，超过上限 {MAX_REACTIVE_STEPS}，终止")
+    if state["steps"] >= wd.MAX_ROUNDS:
+        raise RuntimeError(f"反应式分支已调用 {state['steps']} 轮工具，超过上限 {wd.MAX_ROUNDS}，终止")
 
     user_prompt = REACTIVE_PROMPT.format(
-        tool_descriptions=build_tool_descriptions(),
-        tool_names=", ".join(TOOL_MAP),
+        tool_descriptions=wd.build_tool_descriptions(),
+        tool_names=", ".join(wd.TOOL_MAP),
         history=state["history"],
         question=state["question"],
         scratchpad=state["scratchpad"] or "（当前还没有调用过工具）",
     )
-    raw = _chat_with_system(SYSTEM_PROMPT, user_prompt)
+    raw = wd.chat_with_system(SYSTEM_PROMPT, user_prompt)
     round_no = state["steps"] + 1
     print(f"\n[反应式分支 第 {round_no} 轮]\n{raw.strip()}")
 
-    kind, payload = _parse_output(raw)
+    kind, payload = wd.parse_react_output(raw)
     if kind == "finish":
         return {"final_answer": payload, "scratchpad": state["scratchpad"] + f"{raw.strip()}\n"}
 
@@ -289,9 +220,9 @@ def reactive_agent(state: HybridState) -> dict:
 
 def execute_tools(state: HybridState) -> dict:
     """执行上一步解析出的工具调用，把返回值回灌进 scratchpad"""
-    tool_item = TOOL_MAP.get(state["pending_tool"])
+    tool_item = wd.TOOL_MAP.get(state["pending_tool"])
     if tool_item is None:
-        observation = f"工具 {state['pending_tool']} 不存在，可用工具：{', '.join(TOOL_MAP)}"
+        observation = f"工具 {state['pending_tool']} 不存在，可用工具：{', '.join(wd.TOOL_MAP)}"
     else:
         observation = str(tool_item.invoke(state["pending_input"]))
 
@@ -314,12 +245,8 @@ def after_reactive(state: HybridState) -> str:
 def collect_energy(state: HybridState) -> dict:
     """固定分析分支第一步：真实调用工具采集数据，不让模型生成"""
 
-    energy = str(query_energy_stat.invoke({"storage_name": "全部"}))
-
-    env_snippets: List[str] = []
-    for key in STORAGE_ENV:
-        floor_no, name = key.split("-", 1)
-        env_snippets.append(str(query_environment.invoke({"storage_name": f"{floor_no}楼{name}"})))
+    energy = str(wd.query_energy_stat.invoke({"storage_name": "全部"}))
+    env_snippets = wd.collect_environment_all()
     env_data = "\n".join(env_snippets)
 
     print(f"[采集能耗] {energy[:200]}")
@@ -337,7 +264,7 @@ def analyze_energy(state: HybridState) -> dict:
         env_data=state["env_data"],
         question=state["question"],
     )
-    analysis = _chat_with_system(SYSTEM_PROMPT, user_prompt).strip()
+    analysis = wd.chat_with_system(SYSTEM_PROMPT, user_prompt).strip()
     print(f"\n[深度分析]\n{analysis}")
     return {"analysis": analysis}
 
@@ -345,7 +272,7 @@ def analyze_energy(state: HybridState) -> dict:
 def recommend(state: HybridState) -> dict:
     """深思熟虑层第三步：生成建议，只给可执行动作，不重复分析结论"""
     user_prompt = RECOMMEND_PROMPT.format(analysis=state["analysis"], priority=state["priority"])
-    recommendation = _chat_with_system(SYSTEM_PROMPT, user_prompt).strip()
+    recommendation = wd.chat_with_system(SYSTEM_PROMPT, user_prompt).strip()
     print(f"\n[生成建议]\n{recommendation}")
     return {"recommendation": recommendation}
 
@@ -390,24 +317,15 @@ def build_graph():
     return workflow.compile()
 
 
-def _format_history(history: List[Tuple[str, str]]) -> str:
-    """把多轮历史拼成提示词片段，只保留最近五轮"""
-    if not history:
-        return "无"
-    return "\n".join(f"用户：{asked}\n助手：{answered}" for asked, answered in history[-5:])
-
-
 def run_hybrid_agent(question: str, history: Optional[List[Tuple[str, str]]] = None) -> str:
     """执行一次混合式推理，返回最终答复"""
-    scope_reply = check_scope(question)
+    scope_reply = wd.guard_scope(question, "直接答复，不进入路由")
     if scope_reply is not None:
-        print("[边界预检] 命中职责范围外话题，直接答复，不进入路由")
-        print(f"[Final Answer]\n{scope_reply}")
         return scope_reply
 
     initial: HybridState = {
         "question": question,
-        "history": _format_history(history or []),
+        "history": wd.format_history(history or []),
         "query_type": "",
         "processing_mode": "",
         "priority": "",
@@ -427,33 +345,16 @@ def run_hybrid_agent(question: str, history: Optional[List[Tuple[str, str]]] = N
 
 
 def main() -> None:
-    print("=== 库房大屏助手（混合式）===")
-    print(f"模型：{LLM_MODEL}")
-    print("简单查询走反应式分支，跨库房对比分析走固定采集流程")
-    print("示例：3楼2号库房的低氧库区在什么位置")
-    print("示例：对比一下各库房的能耗情况")
-    print("输入 退出 结束会话\n")
-
-    history: List[Tuple[str, str]] = []
-    while True:
-        try:
-            question = input("请输入问题：").strip()
-        except (EOFError, KeyboardInterrupt):
-            print("\n已退出")
-            break
-
-        if not question:
-            continue
-        if question.lower() in ("退出", "exit", "quit"):
-            print("已退出")
-            break
-
-        try:
-            answer = run_hybrid_agent(question, history)
-            history.append((question, answer))
-        except Exception as exc:
-            print(f"\n[执行失败] {exc}")
-        print("-" * 60)
+    wd.run_cli(
+        "混合式",
+        run_hybrid_agent,
+        lines=(
+            "简单查询走反应式分支，跨库房对比分析走固定采集流程",
+            "示例：3楼2号库房的低氧库区在什么位置",
+            "示例：对比一下各库房的能耗情况",
+        ),
+        with_history=True,
+    )
 
 
 if __name__ == "__main__":
